@@ -6,9 +6,6 @@
 
 Show `authorized_keys` or `known_hosts` in an easy to read format.
 
-`ssh-show-digests` shows { user@host, algorithm, key-digest }
-in a format that is easier to read.
-
 #### The Problem
 
 Sometimes `authorized_keys` or `known_hosts` files
