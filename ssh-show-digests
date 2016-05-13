@@ -1,0 +1,296 @@
+#! /usr/bin/perl -w
+    eval 'exec /usr/bin/perl -S $0 ${1+"$@"}'
+        if 0; #$running_under_some_shell
+
+# Filename: ssh-show-digest
+# Brief: Show known_hosts or authrorized_keys in an easy to read format.
+#
+# Copyright (C) 2016 Guy Shaw
+# Written by Guy Shaw <gshaw@acm.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as
+# published by the Free Software Foundation; either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=pod
+
+=begin description
+
+Show ~/.ssh/known_hosts or ~/.ssh/authorized_keys in an easy to read format.
+
+Sometimes known_hosts files or authorized_keys files get cluttered with
+duplicates, dead keys, things copied in from other systems, and so on.
+It can be difficult to just look at a raw known_hosts or authorized_keys
+file and tell where the problems are.
+
+ssh-show-digest provides some visual aids.
+  1) It formats the data.
+  2) It shows a digest of the public key instead of the key itself.
+  3) It show a small digest-id, which is even smaller than a digest.
+  4) It prints a report of duplicates, at the end.
+
+This sort of visual aid is likely to be even more helpful
+as minimum requirements for keys evolve.  It is likely that
+the key generation algorithms in common use will get better.
+But, better algorithms or no, the generated keys will likely get longer.
+
+In the case of ~/.ssh/known_hosts, 
+ssh-show-digest shows { hostname, algorithm, public-key-digest }.
+
+In the case of ~/.ssh/authorized_keys,
+ssh-show-digest shows { user@host, algorithm, public-key-digest }.
+
+You can specify one of --keys  or --hosts options.
+If neither option is given, then ssh-show-digest
+will attempt to auto-detect the file type.
+
+You need to specify on of --keys or --hosts options.
+
+=end description
+
+=cut
+
+require 5.0;
+use strict;
+use warnings;
+use Carp;
+use diagnostics;
+use Getopt::Long;
+use File::Spec::Functions;
+use Cwd qw(getcwd);             # Needed at least for explain_cwd()
+use Digest::SHA qw(sha1 sha1_hex);
+
+my $eprint_fh = *STDERR;
+my $dprint_fh = *STDERR;
+
+my $debug   = 0;
+my $verbose = 0;
+
+my $show_authorized_keys = 0;
+my $show_known_hosts     = 0;
+
+my @options = (
+    'debug'   => \$debug,
+    'verbose' => \$verbose,
+    'keys|k'  => \$show_authorized_keys,
+    'hosts|h' => \$show_known_hosts,
+);
+
+#:subroutines:#
+
+# Decide how to direct eprint*() and dprint*() functions.
+# If STDOUT and STDERR are directed to the same "channel",
+# then eprint*() and dprint*() should be tied to the same file handle.
+#
+# Otherwise, buffering could cause a mix of STDOUT and STDERR to
+# be written out of order.
+#
+sub set_print_fh {
+    my @stdout_statv;
+    my @stderr_statv;
+    my $stdout_chan;
+    my $stderr_chan;
+
+    @stdout_statv = stat(*STDOUT);
+    @stderr_statv = stat(*STDERR);
+    $stdout_chan = join(':', @stdout_statv[0, 1, 6]);
+    $stderr_chan = join(':', @stderr_statv[0, 1, 6]);
+    if (!defined($eprint_fh)) {
+        $eprint_fh = ($stderr_chan eq $stdout_chan) ? *STDOUT : *STDERR;
+    }
+    if (!defined($dprint_fh)) {
+        $dprint_fh = ($stderr_chan eq $stdout_chan) ? *STDOUT : *STDERR;
+    }
+}
+
+sub eprint {
+    if (-t $eprint_fh) {
+        print {$eprint_fh} "\e[01;31m\e[K", @_, "\e[m\e[K";
+    }
+    else {
+        print {$eprint_fh} @_;
+    }
+}
+
+sub eprintf {
+    if (-t $eprint_fh) {
+        print  {$eprint_fh}  "\e[01;31m\e[K";
+        printf {$eprint_fh} @_;
+        print  {$eprint_fh}  "\e[m\e[K";
+    }
+    else {
+        printf {$eprint_fh} @_;
+    }
+}
+
+sub dprint {
+    print {$dprint_fh} @_ if ($debug);
+}
+
+sub dprintf {
+    printf {$dprint_fh} @_ if ($debug);
+}
+
+# This is a rather loose pattern to tell if some field is public-key algorithm
+# But, if we get too strict, then things will have to be revised
+# more often, as new algorithms are introduced.
+#
+# Also, this test is used in conjuction with is_public_key() test
+# on some other field, so false positives are not so likely.
+#
+sub is_pk_algorithm {
+    return ($_[0] =~ m/ssh|rsa|dsa|sha|nist/);
+}
+
+# Whatever kind of public keys we are dealing with, they are probably
+# longer than 20 characters.  But the names of public key algorithms
+# are usually pretty short.
+#
+sub is_public_key {
+    return length($_[0]) > 20;
+}
+
+sub autodetect_hosts_or_authkeys {
+    if (is_pk_algorithm($_[0]) && is_public_key($_[1])) {
+        $show_authorized_keys = 1;
+    }
+    elsif (is_pk_algorithm($_[1])) {
+        $show_known_hosts = 1;
+    }
+    else {
+        eprint
+            "Automatic detection of ssh file type failed.\n",
+            "Input does not look like any known format:\n",
+            "Not authorized_keys and not known_hosts.\n";
+        exit 2;
+    }
+}
+
+#:options:#
+
+set_print_fh();
+
+GetOptions(@options) or exit 2;
+
+if ($show_authorized_keys && $show_known_hosts) {
+    eprint "Options '--keys' and '--hosts' are mutually exclusive.\n";
+    exit 2;
+}
+
+#:main:#
+
+sub key_to_digest {
+    return sha1_hex($_[0]);
+}
+
+my @unique_digest_list = ();
+my %unique_digest_set  = ();
+my @ref_count = ();
+my $lnr;
+my $err;
+
+$err = 0;
+for my $fname (@ARGV) {
+    if (! -e $fname) {
+        eprint "File '${fname}' does not exist.\n";
+        $err = 1;
+    }
+    elsif (! -f $fname) {
+        eprint "File '${fname}' is not a regular file.\n";
+        system('ls', '-dlh', $fname);
+        $err = 1;
+    }
+}
+
+if ($err) {
+    exit 2;
+}
+
+$lnr = 0;
+while (<>) {
+    chomp;
+    s{\r\z}{}msx;
+    s{\#.*}{}msx;
+    s{\s+\z}{}msx;
+    next if ($_ eq '');
+
+    my @fld;
+    my $nfld;
+    my ($dbkey, $algorithm, $public_key);
+    @fld = split;
+    $nfld = scalar(@fld);
+    if ($nfld != 3) {
+        eprintf("ERROR: expecting 3 fields, got %u.\n", $nfld);
+        ++$lnr;
+        eprint('  ', $_, "\n");
+        ++$lnr;
+        next;
+    }
+
+    if (!($show_authorized_keys || $show_known_hosts)) {
+        autodetect_hosts_or_authkeys(@fld);
+    }
+
+    if ($show_authorized_keys) {
+        ($algorithm, $public_key, $dbkey) = @fld;
+    }
+    elsif ($show_known_hosts) {
+        ($dbkey, $algorithm, $public_key) = @fld;
+    }
+
+    my $digest = key_to_digest($public_key);
+    my $udid = $unique_digest_set{$digest};
+    if (!defined($udid)) {
+        $udid = scalar(@unique_digest_list);
+        push(@unique_digest_list, $digest);
+        $unique_digest_set{$digest} = $udid;
+        $ref_count[$udid] = 0;
+    }
+
+    ++$ref_count[$udid];
+
+    if ($lnr > 0) {
+        print "\n";
+    }
+    print $dbkey, "\n";
+    print '    Algorithm:  ', $algorithm, "\n";
+    print '    Key-digest: ', sprintf('[%02u]', $udid), ' ', $digest, "\n";
+    $lnr += 3;
+}
+
+my $udid;
+my $max_ref_count;
+
+$max_ref_count = 0;
+for ($udid = 0; $udid < scalar(@ref_count); ++$udid) {
+    if ($ref_count[$udid] > $max_ref_count) {
+        $max_ref_count = $ref_count[$udid];
+    }
+}
+
+my $cwidth = length($max_ref_count);
+my $refc_fmt = sprintf('%%%uu', $cwidth);
+my $enr = 0;
+for ($udid = 0; $udid < scalar(@ref_count); ++$udid) {
+    if ($ref_count[$udid] >= 2) {
+        if ($enr == 0) {
+            print "\n";
+            print "Non-unique public keys:\n";
+            print "     id  count\n";
+            print "    ---- ", '-' x $cwidth, "\n";
+        }
+        printf "    [%02u] ${refc_fmt}\n", $udid, $ref_count[$udid];
+        ++$enr;
+    }
+}
+
+exit 0;
